@@ -27,7 +27,8 @@ import {
   type ScenarioComparison,
 } from "../scenarios/scenarioViewModel";
 import { removeProject, updateProject } from "../projects/projectViewModel";
-import { simulateProject } from "../../shared/domain/simulation";
+import { SimulationSession } from "../../shared/domain/incrementalSimulation";
+import { SaveScheduler } from "../../shared/services/saveScheduler";
 
 export type LabStatus =
   "loading" | "ready" | "editing" | "simulating" | "error" | "completed";
@@ -49,15 +50,46 @@ export function useLatencyLab() {
   const [persisted, setPersisted] = useState<"saving" | "saved" | "error">(
     "saved",
   );
-  const queue = useRef(Promise.resolve());
-  const revision = useRef(0);
+  const sessionRef = useRef<{
+    projectId: string;
+    session: SimulationSession;
+  } | null>(null);
+  const lastCommitStatus = useRef<LabStatus>("editing");
+  const saveScheduler = useMemo(
+    () =>
+      new SaveScheduler<WorkspaceDocument>(
+        (next) => repository.save(next),
+        (outcome, isLatest) => {
+          if (!isLatest) return;
+          if (outcome === "saved") {
+            setPersisted("saved");
+            if (lastCommitStatus.current === "editing") setStatus("completed");
+          } else {
+            setPersisted("error");
+            setStatus("error");
+            setNotice("保存失败。数据仍保留在当前页面，请重试保存。");
+          }
+        },
+      ),
+    [repository],
+  );
   const activeProject =
     document?.projects.find(
       (project) => project.id === document.activeProjectId,
     ) ?? document?.projects[0];
+  const getSession = useCallback((projectId: string) => {
+    if (sessionRef.current?.projectId !== projectId) {
+      // 切换项目后整体重算，中间结果不跨项目复用
+      sessionRef.current = { projectId, session: new SimulationSession() };
+    }
+    return sessionRef.current.session;
+  }, []);
   const result = useMemo(
-    () => (activeProject ? simulateProject(activeProject, mode) : undefined),
-    [activeProject, mode],
+    () =>
+      activeProject
+        ? getSession(activeProject.id).run(activeProject, mode)
+        : undefined,
+    [activeProject, mode, getSession],
   );
   const graphAnalysis = useMemo(
     () => (activeProject ? getGraphAnalysis(activeProject) : undefined),
@@ -111,29 +143,15 @@ export function useLatencyLab() {
 
   const commit = useCallback(
     (next: WorkspaceDocument, nextStatus: LabStatus = "editing") => {
-      const currentRevision = ++revision.current;
+      lastCommitStatus.current = nextStatus;
       documentRef.current = next;
       setDocument(next);
       setStatus(nextStatus);
       setNotice("");
       setPersisted("saving");
-      queue.current = queue.current
-        .then(() => repository.save(next))
-        .then(() => {
-          if (revision.current === currentRevision) {
-            setPersisted("saved");
-            if (nextStatus === "editing") setStatus("completed");
-          }
-        })
-        .catch(() => {
-          if (revision.current === currentRevision) {
-            setPersisted("error");
-            setStatus("error");
-            setNotice("保存失败。数据仍保留在当前页面，请重试保存。");
-          }
-        });
+      saveScheduler.submit(next);
     },
-    [repository],
+    [saveScheduler],
   );
 
   const editProject = useCallback(
@@ -216,7 +234,7 @@ export function useLatencyLab() {
     (nextMode = mode) => {
       if (!activeProject) return undefined;
       setStatus("simulating");
-      const result = simulateProject(activeProject, nextMode);
+      const result = getSession(activeProject.id).run(activeProject, nextMode);
       setMode(nextMode);
       setStatus(
         result.warnings.some((warning) => warning.includes("循环"))
@@ -225,13 +243,13 @@ export function useLatencyLab() {
       );
       return result;
     },
-    [activeProject, mode],
+    [activeProject, mode, getSession],
   );
 
   const saveSnapshot = useCallback(
     (name: string): boolean => {
       if (!activeProject) return false;
-      const result = simulateProject(activeProject, mode);
+      const result = getSession(activeProject.id).run(activeProject, mode);
       if (result.entries.length !== activeProject.nodes.length) {
         setNotice(result.warnings[0] ?? "请先修复链路配置再保存方案。");
         return false;
@@ -245,7 +263,7 @@ export function useLatencyLab() {
       setNotice("方案快照已保存。");
       return true;
     },
-    [activeProject, editProject, mode],
+    [activeProject, editProject, mode, getSession],
   );
 
   const removeSavedScenario = useCallback(

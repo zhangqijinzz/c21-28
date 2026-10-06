@@ -7,7 +7,15 @@ import type {
   TimelineEntry,
 } from "./types";
 
-function expectedAttempts(node: RequestNode, mode: SimulationMode): number {
+export interface SlotState {
+  endMs: number;
+  nodeId: string | undefined;
+}
+
+export function baseDurationMs(
+  node: RequestNode,
+  mode: SimulationMode,
+): number {
   const jitterFactor = mode === "low" ? 0 : mode === "high" ? 1 : 0.5;
   const serviceMs = Math.min(
     node.durationMs + node.jitterMs * jitterFactor,
@@ -25,25 +33,11 @@ function expectedAttempts(node: RequestNode, mode: SimulationMode): number {
   return elapsed;
 }
 
-export function simulateProject(
+export function applyFallbackWeights(
   project: LatencyProject,
-  mode: SimulationMode = "expected",
-): SimulationResult {
-  const analysis = analyzeGraph(project);
-  if (analysis.validation.errors.length) {
-    return {
-      mode,
-      completionMs: 0,
-      criticalPath: [],
-      entries: [],
-      warnings: analysis.validation.errors,
-    };
-  }
-
+  baseDurations: Map<string, number>,
+): Map<string, number> {
   const byId = new Map(project.nodes.map((node) => [node.id, node]));
-  const baseDurations = new Map(
-    project.nodes.map((node) => [node.id, expectedAttempts(node, mode)]),
-  );
   const durations = new Map(baseDurations);
   for (const node of project.nodes) {
     const fallback = node.fallbackNodeId
@@ -58,63 +52,112 @@ export function simulateProject(
       );
     }
   }
+  return durations;
+}
 
+export function modeledDurations(
+  project: LatencyProject,
+  mode: SimulationMode,
+): Map<string, number> {
+  return applyFallbackWeights(
+    project,
+    new Map(project.nodes.map((node) => [node.id, baseDurationMs(node, mode)])),
+  );
+}
+
+export function slotCountFor(project: LatencyProject): number {
   const concurrency =
     project.concurrencyLimit ?? Math.max(1, project.nodes.length);
-  const slots = Array.from(
-    { length: Math.max(1, Math.min(concurrency, project.nodes.length || 1)) },
-    (_, index) => ({
-      index,
-      endMs: 0,
-      nodeId: undefined as string | undefined,
-    }),
+  return Math.max(1, Math.min(concurrency, project.nodes.length || 1));
+}
+
+export function createSlots(slotCount: number): SlotState[] {
+  return Array.from({ length: Math.max(1, slotCount) }, () => ({
+    endMs: 0,
+    nodeId: undefined,
+  }));
+}
+
+export function chooseSlot(slots: SlotState[]): SlotState {
+  return slots.reduce(
+    (best, candidate) => (candidate.endMs < best.endMs ? candidate : best),
+    slots[0]!,
   );
+}
+
+export function recordEntry(
+  entriesById: Map<string, TimelineEntry>,
+  entry: TimelineEntry,
+): void {
+  if (!entriesById.has(entry.nodeId)) entriesById.set(entry.nodeId, entry);
+}
+
+export function computeTimelineEntry(
+  node: RequestNode,
+  slots: SlotState[],
+  entriesById: Map<string, TimelineEntry>,
+  modeledDurationMs: number,
+): TimelineEntry {
+  const slot = chooseSlot(slots);
+  const dependencyEntries = node.dependencyIds
+    .map((dependencyId) => entriesById.get(dependencyId))
+    .filter((entry): entry is TimelineEntry => Boolean(entry));
+  const latestDependency = dependencyEntries.reduce<TimelineEntry | undefined>(
+    (latest, entry) => (!latest || entry.endMs > latest.endMs ? entry : latest),
+    undefined,
+  );
+  const startMs = Math.max(slot.endMs, latestDependency?.endMs ?? 0);
+  const resourceBlocked = slot.endMs > (latestDependency?.endMs ?? 0);
+  const predecessor = resourceBlocked ? slot.nodeId : latestDependency?.nodeId;
+  const endMs = startMs + modeledDurationMs;
+  const entry: TimelineEntry = {
+    nodeId: node.id,
+    startMs,
+    endMs,
+    modeledDurationMs,
+    waitMs: Math.max(
+      0,
+      startMs -
+        dependencyEntries.reduce((end, item) => Math.max(end, item.endMs), 0),
+    ),
+    ...(predecessor ? { criticalPredecessorId: predecessor } : {}),
+  };
+  slot.endMs = endMs;
+  slot.nodeId = node.id;
+  return entry;
+}
+
+export function scheduleEntries(
+  project: LatencyProject,
+  order: string[],
+  durations: Map<string, number>,
+  slotCount: number,
+): TimelineEntry[] {
+  const byId = new Map(project.nodes.map((node) => [node.id, node]));
+  const slots = createSlots(slotCount);
+  const entriesById = new Map<string, TimelineEntry>();
   const entries: TimelineEntry[] = [];
-  for (const id of analysis.order) {
+  for (const id of order) {
     const node = byId.get(id);
     if (!node) continue;
-    const slot = slots.reduce(
-      (best, candidate) => (candidate.endMs < best.endMs ? candidate : best),
-      slots[0]!,
+    const entry = computeTimelineEntry(
+      node,
+      slots,
+      entriesById,
+      durations.get(id) ?? 0,
     );
-    const dependencyEntries = node.dependencyIds
-      .map((dependencyId) =>
-        entries.find((entry) => entry.nodeId === dependencyId),
-      )
-      .filter((entry): entry is TimelineEntry => Boolean(entry));
-    const latestDependency = dependencyEntries.reduce<
-      TimelineEntry | undefined
-    >(
-      (latest, entry) =>
-        !latest || entry.endMs > latest.endMs ? entry : latest,
-      undefined,
-    );
-    const startMs = Math.max(slot.endMs, latestDependency?.endMs ?? 0);
-    const resourceBlocked = slot.endMs > (latestDependency?.endMs ?? 0);
-    const predecessor = resourceBlocked
-      ? slot.nodeId
-      : latestDependency?.nodeId;
-    const modeledDurationMs = durations.get(id) ?? 0;
-    const endMs = startMs + modeledDurationMs;
-    entries.push({
-      nodeId: id,
-      startMs,
-      endMs,
-      modeledDurationMs,
-      waitMs: Math.max(
-        0,
-        startMs -
-          dependencyEntries.reduce(
-            (end, entry) => Math.max(end, entry.endMs),
-            0,
-          ),
-      ),
-      ...(predecessor ? { criticalPredecessorId: predecessor } : {}),
-    });
-    slot.endMs = endMs;
-    slot.nodeId = id;
+    entries.push(entry);
+    recordEntry(entriesById, entry);
   }
+  return entries;
+}
 
+export function buildSimulationResult(
+  project: LatencyProject,
+  mode: SimulationMode,
+  entries: TimelineEntry[],
+  validationWarnings: string[],
+): SimulationResult {
   const lastEntry = entries.reduce<TimelineEntry | undefined>(
     (latest, entry) => (!latest || entry.endMs > latest.endMs ? entry : latest),
     undefined,
@@ -127,7 +170,7 @@ export function simulateProject(
         : []),
       entry.nodeId,
     ]);
-  const warnings = [...analysis.validation.warnings];
+  const warnings = [...validationWarnings];
   if (
     project.nodes.some(
       (node) =>
@@ -147,4 +190,32 @@ export function simulateProject(
     entries,
     warnings,
   };
+}
+
+export function simulateProject(
+  project: LatencyProject,
+  mode: SimulationMode = "expected",
+): SimulationResult {
+  const analysis = analyzeGraph(project);
+  if (analysis.validation.errors.length) {
+    return {
+      mode,
+      completionMs: 0,
+      criticalPath: [],
+      entries: [],
+      warnings: analysis.validation.errors,
+    };
+  }
+  const entries = scheduleEntries(
+    project,
+    analysis.order,
+    modeledDurations(project, mode),
+    slotCountFor(project),
+  );
+  return buildSimulationResult(
+    project,
+    mode,
+    entries,
+    analysis.validation.warnings,
+  );
 }
