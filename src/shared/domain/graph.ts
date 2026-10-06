@@ -6,50 +6,95 @@ export interface GraphAnalysis {
   validation: ValidationResult;
 }
 
-export function analyzeGraph(project: LatencyProject): GraphAnalysis {
+export interface DetailedGraphAnalysis extends GraphAnalysis {
+  nodeIssues: Map<string, ValidationResult>;
+  hasMultipleEntries: boolean;
+}
+
+export function validateNode(
+  node: RequestNode,
+  nodeIds: Set<string>,
+): ValidationResult {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  if (!node.name.trim()) errors.push(`${node.id}: 节点名称不能为空`);
+  if (node.durationMs < 0 || !Number.isFinite(node.durationMs))
+    errors.push(`${node.name}: 耗时必须大于等于 0`);
+  if (node.jitterMs < 0 || !Number.isFinite(node.jitterMs))
+    errors.push(`${node.name}: 波动范围必须大于等于 0`);
+  if (node.timeoutMs < 0 || !Number.isFinite(node.timeoutMs))
+    errors.push(`${node.name}: 超时必须大于等于 0`);
+  if (
+    !Number.isInteger(node.retryCount) ||
+    node.retryCount < 0 ||
+    node.retryCount > 8
+  )
+    errors.push(`${node.name}: 重试次数需在 0–8 次`);
+  if (node.failureRate < 0 || node.failureRate > 100)
+    errors.push(`${node.name}: 失败概率需在 0–100%`);
+  if (node.retryCount > 3)
+    warnings.push(`${node.name}: 重试次数较高，可能放大尾延迟`);
+
+  for (const dependencyId of node.dependencyIds) {
+    if (!nodeIds.has(dependencyId)) {
+      errors.push(`${node.name}: 前置节点不存在`);
+      continue;
+    }
+    if (dependencyId === node.id) errors.push(`${node.name}: 不能依赖自身`);
+  }
+
+  if (node.fallbackNodeId) {
+    if (!nodeIds.has(node.fallbackNodeId))
+      errors.push(`${node.name}: 降级目标不存在`);
+    if (node.fallbackNodeId === node.id)
+      errors.push(`${node.name}: 降级目标不能是自身`);
+  }
+
+  return { errors, warnings };
+}
+
+function formatCycle(cycle: string[], project: LatencyProject): string {
+  return `检测到循环依赖：${cycle
+    .map((id) => project.nodes.find((node) => node.id === id)?.name ?? id)
+    .join(" → ")}`;
+}
+
+export function buildGraphValidation(
+  project: LatencyProject,
+  analysis: Pick<GraphAnalysis, "cycle" | "order">,
+  nodeIssues: Map<string, ValidationResult>,
+  hasMultipleEntries: boolean,
+): ValidationResult {
+  const errors = project.nodes.flatMap(
+    (node) => nodeIssues.get(node.id)?.errors ?? [],
+  );
+  const warnings = project.nodes.flatMap(
+    (node) => nodeIssues.get(node.id)?.warnings ?? [],
+  );
+  if (analysis.cycle.length) errors.push(formatCycle(analysis.cycle, project));
+  if (hasMultipleEntries)
+    warnings.push("多个入口节点会同时开始；并发上限可能让部分入口排队");
+  return { errors, warnings };
+}
+
+export function analyzeProjectGraph(
+  project: LatencyProject,
+): DetailedGraphAnalysis {
   const nodeIds = new Set(project.nodes.map((node) => node.id));
   const incoming = new Map(project.nodes.map((node) => [node.id, 0]));
   const outgoing = new Map(
     project.nodes.map((node) => [node.id, [] as string[]]),
   );
-  const errors: string[] = [];
-  const warnings: string[] = [];
+  const nodeIssues = new Map<string, ValidationResult>();
 
   for (const node of project.nodes) {
-    if (!node.name.trim()) errors.push(`${node.id}: 节点名称不能为空`);
-    if (node.durationMs < 0 || !Number.isFinite(node.durationMs))
-      errors.push(`${node.name}: 耗时必须大于等于 0`);
-    if (node.jitterMs < 0 || !Number.isFinite(node.jitterMs))
-      errors.push(`${node.name}: 波动范围必须大于等于 0`);
-    if (node.timeoutMs < 0 || !Number.isFinite(node.timeoutMs))
-      errors.push(`${node.name}: 超时必须大于等于 0`);
-    if (
-      !Number.isInteger(node.retryCount) ||
-      node.retryCount < 0 ||
-      node.retryCount > 8
-    )
-      errors.push(`${node.name}: 重试次数需在 0–8 次`);
-    if (node.failureRate < 0 || node.failureRate > 100)
-      errors.push(`${node.name}: 失败概率需在 0–100%`);
-    if (node.retryCount > 3)
-      warnings.push(`${node.name}: 重试次数较高，可能放大尾延迟`);
+    const issues = validateNode(node, nodeIds);
+    nodeIssues.set(node.id, issues);
     for (const dependencyId of node.dependencyIds) {
-      if (!nodeIds.has(dependencyId)) {
-        errors.push(`${node.name}: 前置节点不存在`);
-        continue;
-      }
-      if (dependencyId === node.id) {
-        errors.push(`${node.name}: 不能依赖自身`);
-        continue;
-      }
+      if (!nodeIds.has(dependencyId) || dependencyId === node.id) continue;
       incoming.set(node.id, (incoming.get(node.id) ?? 0) + 1);
       outgoing.get(dependencyId)?.push(node.id);
-    }
-    if (node.fallbackNodeId) {
-      if (!nodeIds.has(node.fallbackNodeId))
-        errors.push(`${node.name}: 降级目标不存在`);
-      if (node.fallbackNodeId === node.id)
-        errors.push(`${node.name}: 降级目标不能是自身`);
     }
   }
 
@@ -94,17 +139,26 @@ export function analyzeGraph(project: LatencyProject): GraphAnalysis {
       if ((color.get(node.id) ?? 0) === 0 && visit(node.id)) break;
     }
   }
-  if (cycle.length)
-    errors.push(
-      `检测到循环依赖：${cycle.map((id) => project.nodes.find((node) => node.id === id)?.name ?? id).join(" → ")}`,
-    );
-  if (
+
+  const hasMultipleEntries =
     project.nodes.some((node) => node.dependencyIds.length === 0) &&
-    project.nodes.length > 1
-  ) {
-    warnings.push("多个入口节点会同时开始；并发上限可能让部分入口排队");
-  }
-  return { order, cycle, validation: { errors, warnings } };
+    project.nodes.length > 1;
+  const validation = buildGraphValidation(
+    project,
+    { cycle, order },
+    nodeIssues,
+    hasMultipleEntries,
+  );
+  return { order, cycle, validation, nodeIssues, hasMultipleEntries };
+}
+
+export function analyzeGraph(project: LatencyProject): GraphAnalysis {
+  const analysis = analyzeProjectGraph(project);
+  return {
+    order: analysis.order,
+    cycle: analysis.cycle,
+    validation: analysis.validation,
+  };
 }
 
 export function updateNode(
